@@ -5,13 +5,22 @@
 **Date:** 2026-03-29
 **Status:** Draft — awaiting maintainer review
 
+### Executive Summary
+
+- **Problem:** KUs contain sensitive provenance metadata. Consumers and auditors need to verify KU integrity without seeing every field.
+- **Phase 1 mechanism:** SHA-256 hash-commitment with selective disclosure, behind a swappable `ZKPProvider` interface (not a true ZKP — Midnight replaces this in Phase 2).
+- **What exists:** Provider abstraction, graduation auto-commit, 3 REST endpoints, 3 MCP tools, UI badge, 349 passing tests — all on the working branch.
+- **Decisions needed:** 6 concrete maintainer decisions at the top of this document (D1–D6).
+- **What ships next:** 3 PRs — (1) design doc + abstraction, (2) lifecycle + rich states, (3) API/UI surface.
+- **Biggest trade-off:** Server-side salt storage (simpler, but single trust domain) — replaced by on-chain proofs in Phase 2.
+
 > **Note on scope:** Phase 1 implements a hash-commitment selective disclosure scheme — not a true zero-knowledge proof. It provides binding, hiding, and selective disclosure using standard-library SHA-256 behind a `ZKPProvider` interface designed for drop-in replacement by Midnight's ZKP infrastructure in Phase 2. This document uses "ZKP" as the project-level label for the privacy layer, matching the architecture doc and issue #140, while being precise about what Phase 1 actually delivers.
 
 ---
 
 ## My Understanding of Scope
 
-I understand this feature is about proving compliance—ensuring, for instance, that data usage follows privacy rules—without exposing sensitive information. The system would generate these proofs during data use or model training so we can show compliance. If I'm misunderstanding, please let me know so we can adjust the document accordingly before going further.
+Phase 1 adds proof-backed integrity and selective-disclosure metadata to knowledge units at graduation, then surfaces that proof state during retrieval and review. It lets a consumer verify that specific KU fields are authentic without seeing the rest, and it detects post-graduation tampering. It is not a general model-training compliance framework, and it does not by itself establish GDPR compliance — that also requires organisational and procedural controls outside the scope of this system. If this understanding is wrong, please flag it so we can adjust the document before going further.
 
 ---
 
@@ -22,10 +31,10 @@ Before continuing implementation beyond the existing prototype, I need maintaine
 | # | Decision | Recommendation | Alternative | Why |
 |---|---|---|---|---|
 | **D1** | Proof generation failure during `approve_unit()` | **Lenient:** approval succeeds, proof is missing, warning logged | Strict: roll back approval on commitment failure | Blocking approval for a PoC privacy feature risks disrupting the core review workflow. Lenient lets us ship safely; strict can be revisited when Midnight is integrated and proofs are mandatory. |
-| **D2** | Retrieval-time verification strategy | **Cached with 24-hour staleness:** verify once, cache result, re-verify when stale | Verify on every read | Per-read verification adds ~1ms per KU to every query. Cached verification with a configurable threshold is fast, still catches tampering within 24h, and avoids unnecessary overhead for the PoC. |
-| **D3** | Salt ownership model (Phase 1) | **Server-side storage:** salts persisted in `commitments` table alongside KU | Client-held salts: return to committer only, do not persist | Server-side is simpler for PoC: the team API can generate disclosure proofs for any committed KU without requiring the original committer. Downside: the server is a single trust domain. Phase 2 Midnight integration removes this concern since proofs are generated on-chain. |
+| **D2** | Retrieval-time verification strategy | **Cached with 24-hour staleness:** verify once, cache result, re-verify when stale | Verify on every read | Prototype testing suggests per-read verification overhead is low (see [Section 16](#16-performance-and-observability) for non-benchmark estimates). Cached verification with a configurable threshold keeps that cost negligible, still catches tampering within 24h, and avoids unnecessary overhead for the PoC. |
+| **D3** | Salt ownership model (Phase 1) | **Server-side storage:** salts persisted in `commitments` table alongside KU | Client-held salts: return to committer only, do not persist | Server-side is simpler for PoC: the team API can generate disclosure proofs for any committed KU without requiring the original committer. Downside: the server is a single trust domain. Phase 2 Midnight integration is expected to reduce or change this concern, depending on the final on-chain proof model. |
 | **D4** | PR packaging | **Three PRs:** (1) design doc + provider abstraction, (2) lifecycle + schema, (3) API/UI surface | Single PR with everything | Three PRs align with the contributing guide's preference for well-scoped changes. Each PR is independently reviewable and mergeable. |
-| **D5** | KU mutation after commitment | **Detect-and-flag:** mutations (confirm, flag) cause retrieval verification to return `"failed"`, surfaced to consumers; no auto-regeneration in Phase 1 | Auto-regenerate commitment on every mutation | Detect-and-flag is simpler, makes mutation visible rather than silently patching it, and avoids re-commitment overhead. Auto-regeneration is Phase 3. |
+| **D5** | KU mutation after commitment | **Detect-and-flag:** mutations to *committed* fields (e.g. `insight.*`, `evidence.confidence`) cause retrieval verification to return `"failed"`, surfaced to consumers; mutations to non-committed fields (`status`, `flags`) have no effect on proof state; no auto-regeneration in Phase 1 | Auto-regenerate commitment on every mutation | Detect-and-flag is simpler, makes mutation visible rather than silently patching it, and avoids re-commitment overhead. Non-committed fields are deliberately excluded so normal lifecycle operations (confirmation, flagging) never invalidate proofs. Auto-regeneration is Phase 3. |
 | **D6** | Committed field set | **Current 7 fields** (see [Field Selection Rationale](#12-field-selection-rationale-and-versioning)) | Broader or narrower set | These 7 fields cover identity (`created_by`), content (`insight.*`), context, domain classification, and trust signal (`evidence.confidence`). See rationale section for justification and versioning strategy. |
 
 ---
@@ -96,6 +105,8 @@ Every KU has exactly one proof state at any point in time. This table is the sin
 | **failed** | non-null hex | `"failed"` | recent ISO 8601 | `"failed"` | ✗ Failed (red) | Verification ran but root did not match — data may have changed since commitment. |
 | **stale** | non-null hex | `"verified"` | old ISO 8601 (> threshold) | `"stale"` | ⟳ Stale (amber) | Previous verification passed but is older than the staleness threshold. Re-verification needed. |
 
+> **Note on `"stale"`:** `"stale"` does not mean invalid or suspected-tampered. It means *previously verified successfully, but freshness assurance has expired.* A stale KU will be re-verified on its next retrieval and will transition back to `"verified"` or to `"failed"`.
+
 ### State Transitions
 
 ```
@@ -105,7 +116,7 @@ Every KU has exactly one proof state at any point in time. This table is the sin
         ▼
     committed
         │
-        │ retrieval triggers verify_disclosure_proof()
+        │ retrieval triggers verify_commitment_integrity()
         ├────── root matches ──────► verified
         │                                │
         │                                │ time > staleness_threshold
@@ -122,6 +133,8 @@ Every KU has exactly one proof state at any point in time. This table is the sin
 ### Forbidden Aliases
 
 The following terms MUST NOT appear in code, API payloads, or documentation as state names: `"valid"`, `"invalid"`, `"ok"`, `"error"`, `"unknown"`, `"pending"`, `"expired"`. Use only the five canonical states above.
+
+> **Internal verification failure:** If retrieval-time verification cannot complete due to an internal error (malformed commitment, deserialization bug, missing field), Phase 1 does **not** introduce a sixth state. Instead it logs a `WARNING`, preserves the last known state unchanged, and returns the retrieval successfully. See [Section 9.2](#92-retrieval-verification-proposed--phase-1) for the full rule.
 
 ### Derivation Rules
 
@@ -174,6 +187,62 @@ The following 7 KU fields are committed (sorted alphabetically for deterministic
 | `insight.detail` | `unit.insight.detail` | Raw string |
 | `insight.summary` | `unit.insight.summary` | Raw string |
 
+#### Canonical Serialization Rules
+
+These rules define how each field type is converted to a string before hashing. They must be followed exactly to produce deterministic leaf values:
+
+| Rule | Specification |
+|---|---|
+| **Strings** | Used as-is (UTF-8 bytes). No trimming, no Unicode normalization. Empty string `""` is valid. |
+| **Floats** | Python `str()` representation (e.g. `0.85` → `"0.85"`). No fixed-decimal formatting. |
+| **JSON objects** (`context`) | `json.dumps(obj, separators=(",", ":"), sort_keys=True)` — compact, keys sorted alphabetically. |
+| **JSON arrays** (`domain`) | `json.dumps(sorted(arr), separators=(",", ":"))` — elements sorted alphabetically, compact. |
+| **Null / missing fields** | Not supported in Phase 1. All 7 committed fields must be present and non-null at commitment time. A missing field causes `create_commitment()` to raise `ValueError`. |
+| **Ordering** | Fields are always processed in alphabetical order by field name. Leaf concatenation for root computation follows the same order. |
+
+#### Test Vector
+
+Given the following KU fragment:
+
+```json
+{
+  "context": {"project": "acme", "language": "python"},
+  "created_by": "alice",
+  "domain": ["api", "payments"],
+  "evidence": {"confidence": 0.85},
+  "insight": {
+    "summary": "Stripe returns 200 for rate limits",
+    "detail": "Response body contains error object despite 200 status",
+    "action": "Check response body, not just status code"
+  }
+}
+```
+
+Canonical serialized values (in field-alphabetical order):
+
+| Field | Canonical String |
+|---|---|
+| `context` | `{"language":"python","project":"acme"}` |
+| `created_by` | `alice` |
+| `domain` | `["api","payments"]` |
+| `evidence.confidence` | `0.85` |
+| `insight.action` | `Check response body, not just status code` |
+| `insight.detail` | `Response body contains error object despite 200 status` |
+| `insight.summary` | `Stripe returns 200 for rate limits` |
+
+Each leaf is then `SHA-256(salt ‖ field_name ‖ canonical_string)`. The root is `SHA-256(leaf_context ‖ leaf_created_by ‖ … ‖ leaf_insight.summary)`. Any implementation that produces different canonical strings for these inputs is incompatible.
+
+#### Negative Test Vector (Incompatible Serialization)
+
+The following variations of the same input data produce **different** canonical strings and therefore different roots. Any implementation that produces these is broken:
+
+| Field | Wrong Serialization | Why It Fails |
+|---|---|---|
+| `context` | `{"project": "acme", "language": "python"}` | Keys not sorted; contains spaces after separators |
+| `domain` | `["payments","api"]` | Elements not sorted alphabetically |
+| `evidence.confidence` | `0.850` | Trailing zero; Python `str(0.85)` produces `"0.85"` |
+| `insight.summary` | `Stripe returns 200 for rate limits ` | Trailing whitespace; strings are used as-is, so source data must not have been trimmed |
+
 ### Failure Modes
 
 | Failure | Cause | Behaviour |
@@ -185,6 +254,21 @@ The following 7 KU fields are committed (sorted alphabetically for deterministic
 | **Wrong KU binding** | Proof was generated from a different KU's commitment | Verification returns `false` — root mismatch |
 | **No commitment exists** | KU was never committed (e.g. pre-migration KU) | `proof_status = "none"` — verification not applicable |
 | **Provider failure** | Proof generation fails (e.g. missing fields, provider error) | HTTP error surfaced; KU is still approved but `proof_status = "none"` |
+
+### What This Does Not Prove
+
+Phase 1 proves a narrow claim: **the disclosed fields of a KU match what was committed at graduation**. It does **not** prove:
+
+> **Important:** A `"verified"` proof means the KU's committed fields still match the graduation-time snapshot. It does **not** mean the data is globally correct, current, or the best available business truth. A legitimate post-graduation update will cause `"failed"`, which is expected behavior — not evidence of wrongdoing. Downstream systems should not use proof state as a proxy for semantic quality, business correctness, or reviewer approval — it attests only to field-level integrity relative to the committed snapshot.
+
+- **Lawful basis for processing.** Whether the organisation has a legal basis under GDPR Article 6 to process the data in the KU.
+- **User consent.** Whether a data subject consented to their data being included in the knowledge system.
+- **Deletion or erasure.** Whether data was actually deleted in response to a right-to-erasure request (Phase 2 goal).
+- **Model-training provenance.** Whether a KU was used correctly during model training, fine-tuning, or inference.
+- **Data minimisation compliance.** Whether only the minimum necessary data was collected or stored.
+- **Cross-system integrity.** Whether the KU's data matches an external source of truth outside CQ.
+
+This system provides one building block — field-level integrity and selective disclosure — within a broader GDPR compliance programme that must also include organisational policies, data-subject rights workflows, and legal review.
 
 ---
 
@@ -261,6 +345,8 @@ The following work has been completed as an exploratory prototype. This design d
 └─────────────────────────────────────────────────────────────┘
 ```
 
+> **Concurrency note:** Phase 1 relies on SQLite WAL mode for write serialization. Concurrent reads and writes to the same KU are safe because SQLite WAL provides snapshot isolation for readers and serializes writers. This is a property of the current storage backend, not the general design. If the backend changes (e.g. to PostgreSQL), concurrency guarantees must be re-evaluated for the new isolation model.
+
 ### Proof Lifecycle Sequence
 
 ```
@@ -309,6 +395,36 @@ The following work has been completed as an exploratory prototype. This design d
     │                     │  {valid: true}      │                    │
     │                     │────────────────────────────────────────>│
 ```
+
+### End-to-End Scenario
+
+A concrete walkthrough of the full proof lifecycle:
+
+1. **Agent proposes a KU.** An AI agent calls `POST /propose` with a KU about Stripe rate-limit behaviour. The KU enters the review queue with `proof_status = "none"`.
+
+2. **Reviewer approves.** Alice calls `POST /review/{id}/approve`. The API sets status to `"approved"`, then auto-calls `create_commitment(unit)`. The 7 committed fields are hashed with random salts, a root is computed, and the commitment (including salts) is stored in the `commitments` table. The KU's `commitment_root` column is set. `proof_status` is now `"committed"`.
+
+3. **Consumer queries.** A different agent calls `GET /query?domain=api`. The API fetches the KU, finds a commitment, and runs `verify_commitment_integrity()` — recomputing the root from current field values. The roots match, so `proof_verification_result = "verified"` and `proof_verified_at` is set to now. Response includes `proof_status: "verified"`.
+
+4. **Consumer requests selective disclosure.** The agent only needs `insight.summary` and `domain` for its task. It calls `POST /zkp/disclose/{id}` with `fields: ["insight.summary", "domain"]`. The API returns a proof containing the two field values, their salts, and opaque leaf hashes for the other 5 fields.
+
+5. **Consumer verifies.** The agent (or a third party, within a CQ-controlled or trusted integration context) calls `POST /zkp/verify` with the proof. The verifier recomputes the two disclosed leaves, combines them with the 5 undisclosed leaf hashes, derives the root, and confirms it matches. Response: `{valid: true}`. The consumer now knows `insight.summary` and `domain` are authentic without ever seeing `created_by`, `context`, `evidence.confidence`, etc.
+
+6. **Time passes.** 25 hours later, another consumer queries the same KU. The cached verification is now older than the 24-hour staleness threshold, so `proof_status = "stale"`. The API re-runs `verify_commitment_integrity()`, roots still match, and `proof_status` updates back to `"verified"`.
+
+7. **Tampering detected (hypothetical).** If someone had modified `insight.summary` in the database between steps 3 and 6, the recomputed root would not match the stored `commitment_root`. The API would set `proof_status = "failed"`, and the consumer would see a red badge in the UI.
+
+### Reviewer-Centered Scenario
+
+1. **Alice opens the review queue.** She sees 5 KUs awaiting review. Three have no proof badge (`"none"` — they were proposed but not yet approved). Two were previously approved and show ✓ Verified (green).
+
+2. **Alice approves a new KU.** After clicking approve, the KU's badge changes from no badge to 🛡 Committed (gray). It will auto-verify on the next retrieval.
+
+3. **Next morning, Alice checks the dashboard.** One of the previously-verified KUs now shows ✗ Failed (red). She hovers over the badge and sees: "Proof verification failed — data may have been tampered." 
+
+4. **Alice investigates.** She checks the KU's history and finds that a script modified `evidence.confidence` post-graduation (a calibration update). The original commitment no longer matches. She confirms the new value is correct and calls `POST /zkp/commit/{unit_id}` to re-commit with the current data. The badge resets to 🛡 Committed (gray), and the next retrieval will re-verify it.
+
+5. **Meanwhile, another KU shows ⟳ Stale (amber).** This just means the last verification was over 24 hours ago. Alice takes no action — the next query will auto-re-verify and the badge will return to ✓ Verified (green) if the data is intact.
 
 ---
 
@@ -403,7 +519,20 @@ set_provider(provider)            # swap backend at runtime
 | `server.py → zkp_commit` tool | Calls `create_commitment()` via MCP |
 | `server.py → zkp_disclose` tool | Calls `create_disclosure_proof()` via MCP |
 | `server.py → zkp_verify` tool | Calls `verify_disclosure_proof()` via MCP |
-| **Phase 1 NEW** `store.py → get()` | Will call `verify_disclosure_proof()` on retrieval |
+| **Phase 1 NEW** `store.py → get()` | Will call `verify_commitment_integrity()` on retrieval (not the same as `verify_disclosure_proof()` — see [Section 9.2](#92-retrieval-verification-proposed--phase-1)) |
+
+### Why Retrieval Integrity Is Outside the Provider Contract
+
+`verify_commitment_integrity()` is intentionally **not** a method on `ZKPProvider`. The provider contract handles *proof objects* — creating commitments, generating disclosure proofs, and verifying disclosure proofs. Retrieval verification is a different operation: it recomputes the commitment root from current KU field values and compares it against the stored root. It does not involve a proof object at all.
+
+Keeping it separate has three benefits:
+1. **Provider-agnostic.** The retrieval check works the same way regardless of whether the commitment was generated by `HashCommitmentProvider` or `MidnightProvider`, because it only relies on the deterministic root-computation algorithm, which is shared.
+2. **Simpler provider interface.** Providers don't need to know about retrieval lifecycle concerns like staleness thresholds or caching.
+3. **Single implementation.** The root recomputation logic lives in one place (`verify_commitment_integrity()` in `zkp.py`) rather than being duplicated across providers.
+
+If a future provider uses a fundamentally different root-computation algorithm (e.g. Midnight uses a Merkle tree instead of flat concatenation), `verify_commitment_integrity()` will need to dispatch to provider-specific logic. At that point, adding a `verify_commitment(unit, stored_root) → bool` method to the provider protocol is the right path. Phase 1 does not need this because there is only one root-computation algorithm.
+
+> **Phase 1 constraint:** The provider-agnostic property above holds only as long as all providers share the same root-computation algorithm. This is a Phase 1 simplification, not a general architectural guarantee. If Phase 2 introduces a provider with a different root scheme, retrieval integrity must become provider-aware.
 
 ---
 
@@ -447,6 +576,19 @@ class KnowledgeUnit(BaseModel):
 
 All new fields default to `None`, ensuring backward compatibility with existing KUs.
 
+**`proof_provider` semantics:** This field records **the provider that produced the currently stored commitment** — not the system's current default provider, and not the provider used for the last verification. If the system provider changes (e.g. from `"hash-commitment"` to `"midnight"`), existing KUs retain their original `proof_provider` until they are re-committed.
+
+**Mixed-provider coexistence (Phase 2 transition):** When a Phase 2 deployment introduces `MidnightProvider` alongside the existing `HashCommitmentProvider`, both provider types will coexist in the same database:
+- `/query` responses return KUs regardless of their `proof_provider`. The `proof_provider` field tells the consumer which scheme produced the commitment.
+- Retrieval-time `verify_commitment_integrity()` must dispatch to the correct root-computation algorithm based on `proof_provider` (see the Phase 1 constraint note in [Section 7](#7-provider-abstraction)).
+- Disclosure proof payloads are provider-specific — a `hash-commitment` proof and a `midnight` proof have different structures. Consumers must check `proof_provider` before interpreting the payload.
+- Old `hash-commitment` KUs are never auto-migrated to `midnight`. They remain valid under their original provider until explicitly re-committed.
+- **Query response shape guarantee:** Regardless of provider, all KUs expose the same top-level `proof_status`, `proof_provider`, and `proof_verified_at` fields in API responses. The proof-status shape is provider-agnostic. Only the internal disclosure proof payload (returned by `/zkp/disclose`) is provider-specific.
+
+**`proof_provider` null edge case:** `proof_provider` can be `None` when `commitment_root` is non-null if the KU was committed by code that predates the `proof_provider` field (i.e. the existing prototype code, before Phase 1 schema additions land). The API should treat `proof_provider = None` with a non-null `commitment_root` as `"hash-commitment"` (the only provider that could have produced it). Phase 1 migration should backfill existing commitment rows with `proof_provider = "hash-commitment"`.
+
+**Canonical API placement:** `proof_status`, `proof_provider`, and `proof_verified_at` are exposed on both `ReviewItem` responses and KU-bearing `/query` responses. The authoritative persisted fields are on the `KnowledgeUnit` model. `ReviewItem` derives its values from the KU — there is no separate truth source.
+
 ---
 
 ## 9. Lifecycle Integration Points
@@ -463,13 +605,17 @@ All new fields default to `None`, ensuring backward compatibility with existing 
 
 **Failure handling:** If commitment generation fails, the approval still succeeds but `proof_status` remains `"none"`. This avoids blocking the review workflow for a PoC feature. A warning is logged.
 
+> **Phase 1 enforcement policy:** Proof state is **advisory and observable, not a hard enforcement gate.** No API endpoint, UI action, or lifecycle transition is blocked by `"failed"`, `"stale"`, or `"none"` proof status. Consumers and reviewers see the state and decide how to act on it. Although Phase 1 does not enforce proof state as a hard gate, it makes integrity visible in normal workflows and establishes the data model, API surface, and UI hooks required for future enforcement policies. If maintainers want specific gates (e.g. block graduation of previously-failed KUs), that can be added as opt-in policy in Phase 2+.
+
 ### 9.2 Retrieval Verification (Proposed — Phase 1)
 
 **Trigger:** `GET /query?domain=...` and `GET /review/{unit_id}`
 
+> **Important distinction:** Retrieval verification is **not** the same as `verify_disclosure_proof()`. A disclosure proof verifies a selective subset of fields against a root. Retrieval verification is a simpler integrity check: recompute the commitment root from all current KU field values and compare it against the stored `commitment_root`. The operation is `verify_commitment_integrity(unit, stored_root)`, not `verify_disclosure_proof(proof)`.
+
 **Behaviour:**
 1. After fetching a KU, check whether a commitment exists.
-2. If yes, reconstruct the commitment's root from the current KU field values and compare against the stored `commitment_root`.
+2. If yes, recompute the commitment root from the current KU field values using `verify_commitment_integrity()` and compare against the stored `commitment_root`.
 3. Record the verification result and timestamp.
 
 **Proof Status State Machine:**
@@ -477,6 +623,20 @@ All new fields default to `None`, ensuring backward compatibility with existing 
 The proof-state machine is defined in [Section 2: Canonical Proof-State Model](#2-canonical-proof-state-model). The state transitions and derivation rules are the single source of truth for all code.
 
 **Staleness rule:** A verification result older than a configurable threshold (default: 24 hours) is marked `"stale"` and re-verified on next access. This avoids re-verifying on every single query while catching data corruption or tampering.
+
+**Writeback semantics:** When a stale (or first-time) KU is retrieved, the API **synchronously** recomputes the commitment root, persists the updated `proof_verified_at` and `proof_verification_result`, and returns the fresh status in the response. There is no deferred or background refresh — the caller always receives the current verification result, not a stale cached value.
+
+**Timestamp update rule:** `proof_verified_at` is written **only** when a verification actually runs — i.e. on first access after commitment, or when the previous result is stale (older than the staleness threshold). A retrieval that finds a fresh, non-stale `"verified"` result does **not** update the timestamp. This avoids write amplification on hot KUs and ensures `proof_verified_at` reflects the last actual verification, not the last read.
+
+**Internal verification failure (cannot-run):** If retrieval-time verification cannot complete due to an internal error — malformed legacy commitment data, a deserialization bug, a missing field, or an unexpected exception — Phase 1 behaviour is:
+1. Log a `WARNING` with `unit_id`, error detail, and `"verification_error": true`.
+2. **Do not write** to `proof_verification_result` or `proof_verified_at` — leave them unchanged.
+3. Return the **last known proof state** to the caller (e.g. `"committed"`, `"stale"`, or whatever was previously stored).
+4. Do **not** surface a 5xx — the retrieval itself succeeds; only the integrity sidecar fails.
+
+This preserves the principle that proof state is advisory and never blocks normal API operation. The logged warning ensures ops can detect and investigate broken commitments. A future phase may add a sixth state (e.g. `"error"`) if structured error reporting is needed, but Phase 1 avoids expanding the state model for an edge case.
+
+> **Semantic meaning of `"stale"`:** `"stale"` does not mean invalid or suspected-tampered. It means *previously verified successfully, but freshness assurance has expired*. The KU may still be perfectly intact — the system simply has not re-checked recently enough to confirm. A `"stale"` KU will be re-verified on its next retrieval and will transition to `"verified"` (still intact) or `"failed"` (changed since commitment).
 
 ### 9.3 Future Integration Points (Phase 2+)
 
@@ -511,9 +671,11 @@ The proof-state machine is defined in [Section 2: Canonical Proof-State Model](#
 
 ### 10.2 ZKP-Specific Endpoints (Implemented)
 
+> **Phase 1 proof format classification: internal.** The proof format is a **CQ-internal implementation detail**, not a trusted-team interchange format or an external compatibility promise. No consumer — internal or external — should treat the Phase 1 wire format as stable. Proof structure, field names, and serialization may change without notice between phases. The end-to-end scenario in Section 5 shows a third party verifying a proof via `POST /zkp/verify`; this demonstrates the *mechanism*, not a stability guarantee. A stable, versioned proof format suitable for external auditors or third-party integrations is a Phase 2+ deliverable.
+
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/zkp/commit/{unit_id}` | POST | Create a commitment for a KU. Returns the full commitment including salts (caller holds privately). |
+| `/zkp/commit/{unit_id}` | POST | **Team-internal maintenance/recovery API.** Create or overwrite a commitment for a KU. Overwrites any existing commitment (see [Re-Commitment Semantics](#re-commitment-and-overwrite-semantics)). Returns the full commitment including salts. Not intended as a routine consumer action — the normal path is auto-commit on graduation. |
 | `/zkp/disclose/{unit_id}` | POST | Generate a selective disclosure proof for specified fields. Requires a prior commitment. |
 | `/zkp/verify` | POST | Stateless verification of a disclosure proof against its embedded root. No DB access. |
 
@@ -535,6 +697,12 @@ All new fields are optional with defaults:
 
 Existing clients that do not understand these fields can safely ignore them.
 
+### 10.5 API Guidance for `"failed"` Proof Status
+
+For automated consumers (agents, scripts, downstream services): Phase 1 clients should treat `"failed"` as a **high-signal warning, not an automatic rejection**, unless local policy says otherwise. The recommended behaviour is to log the failure, surface it to a human operator, and continue processing. `"failed"` means the KU's committed fields no longer match the graduation-time snapshot — it does not by itself imply malicious intent. The most common causes are benign: data migration, schema evolution, manual DB correction, or an application bug.
+
+**Policy ownership:** CQ surfaces the integrity signal; embedding applications or operators decide enforcement. CQ does not prescribe whether `"failed"` should block downstream processing, trigger alerts, or be silently logged — that is a deployment-specific policy decision outside the scope of this design.
+
 ---
 
 ## 11. UI Changes
@@ -552,6 +720,16 @@ The review UI (`ReviewCard.tsx`) shows a shield badge with "Proof" text when `pr
 | `verified` | ✓ Verified | Green | Proof verified against current data |
 | `failed` | ✗ Failed | Red | Proof verification failed — data may have been tampered |
 | `stale` | ⟳ Stale | Amber | Last verification is older than threshold |
+
+### User Action Guidance
+
+| State | What the reviewer / consumer should do |
+|---|---|
+| `none` | Normal — no proof exists for this KU. No action needed unless proof coverage is required. |
+| `committed` | Proof exists but hasn't been verified yet. Will auto-verify on next retrieval. No manual action needed. |
+| `verified` | Trust normally. The KU's committed fields match the graduation-time snapshot. |
+| `stale` | Trust with caution. A re-verification is pending on the next retrieval. Will auto-resolve to `verified` or `failed`. |
+| `failed` | **Investigate.** The KU's committed fields no longer match the graduation-time commitment. `"failed"` does not by itself imply malicious intent — the most common causes are benign: data migration, manual DB edit, schema evolution, or an application bug. Consider re-committing if the current data is correct, or escalating if tampering is suspected. |
 
 ### Implementation Approach
 
@@ -600,6 +778,10 @@ When the committed field set changes (e.g. Phase 3 adds `evidence.source`):
 
 This avoids a "big bang" migration where all existing commitments must be regenerated.
 
+**Serialization location:** Versioned field-set definitions and their canonical serialization logic live in **provider code** (e.g. `HashCommitmentProvider` contains a version-to-field-set mapping). They are not stored in migration scripts or ad-hoc documentation. When `verify_commitment_integrity()` encounters a commitment, it reads the `commitment_version` to determine which field set and serialization rules apply.
+
+**Ownership rule:** Canonical serialization rules and version-specific verification logic are owned by provider/verifier code, not by migrations, API docs, or UI components. Any change to serialization rules requires a version bump — never a silent change to existing version behaviour.
+
 ---
 
 ## 13. Mutation After Commitment
@@ -626,7 +808,8 @@ Once a KU is committed (i.e. `commitment_root IS NOT NULL`), the following mutat
 ### What Consumers See
 
 When a consumer retrieves a KU via `/query`:
-- If the KU was mutated after commitment, `proof_status` will be `"failed"`.
+- If a *committed field* was mutated after commitment, `proof_status` will be `"failed"`.
+- If only non-committed fields changed (status, flags), `proof_status` is unaffected — still `"verified"` or `"committed"`.
 - The consumer can still use the KU — the data is not hidden. The proof status is informational.
 - The consumer (human or agent) decides how to weight a `"failed"` proof.
 
@@ -651,11 +834,15 @@ When the Phase 1 schema migration runs, all pre-existing KUs will have:
 
 These KUs will show `proof_status = "none"` — no commitment exists, no verification applies. This is safe and correct: they were graduated before the proof system existed.
 
+**Migration safety:** The Phase 1 schema migration (adding columns with `NULL` defaults) is idempotent and safe to run partially. If migration is interrupted, rows that were not yet altered simply remain without the new columns, and the application code treats missing columns as `NULL`. There is no all-or-nothing requirement — partial completion leaves the database in a consistent state. Re-running the migration is harmless.
+
 ### Backfill Strategy
 
 **Phase 1: No backfill.** Only newly-approved KUs get commitments. Existing KUs remain in `"none"` state indefinitely unless a reviewer explicitly calls `POST /zkp/commit/{unit_id}` via the API.
 
 **Rationale:** Backfilling would generate commitments from current data, not data-at-graduation-time. These commitments would be valid but misleading — they prove the KU hasn't changed *since backfill*, not *since graduation*. Phase 3 can add an explicit backfill command with clear semantics (e.g. "re-committed at [timestamp], original graduation commitment not available").
+
+**No-backfill policy:** Phase 1 performs no automatic or lazy backfill of existing KUs. Proof state begins only at new commitments. Old KUs remain in `"none"` state **permanently** unless an operator explicitly calls `POST /zkp/commit/{unit_id}`. There is no planned background job, migration script, or eventual-consistency process that will commit old KUs automatically.
 
 ### Rollback Procedure
 
@@ -684,6 +871,8 @@ This is standard for SQLite migrations and is already the pattern used elsewhere
 
 ## 15. Authorization and Audit Model
 
+> **⚠️ Phase 1 trust assumption:** The authorization model below assumes a single trusted team domain where all authenticated users are trusted peers. It is **not suitable as-is for multi-tenant or adversarial environments.** Phase 2+ should add per-user commitment ownership and restricts who can regenerate or overwrite commitments. If CQ ships multi-tenancy before Phase 2, the auth model must be tightened first.
+
 ### Who Can Do What
 
 | Action | Authorized Actor(s) | Auth Mechanism |
@@ -707,10 +896,64 @@ Phase 1 logs the following at `INFO` level:
 
 | Event | Log Message | Fields |
 |---|---|---|
-| Commitment generated | `"ZKP commitment created"` | `unit_id`, `provider` |
-| Commitment generation failed | `"ZKP commitment failed"` (WARNING) | `unit_id`, `error` |
-| Disclosure proof generated | `"ZKP disclosure proof created"` | `unit_id`, `disclosed_fields` |
-| Verification performed | `"ZKP verification result"` | `unit_id`, `valid` (bool) |
+| Commitment generated | `"ZKP commitment created"` | `unit_id`, `provider`, `timestamp`, `actor` (if available from JWT) |
+| Commitment overwritten | `"ZKP commitment created"` | `unit_id`, `provider`, `timestamp`, `actor`, `"overwrite": true` |
+| Commitment generation failed | `"ZKP commitment failed"` (WARNING) | `unit_id`, `error`, `timestamp` |
+| Disclosure proof generated | `"ZKP disclosure proof created"` | `unit_id`, `disclosed_fields`, `timestamp`, `actor` |
+| Verification performed | `"ZKP verification result"` | `unit_id`, `valid` (bool), `timestamp` |
+
+**Minimum audit event schema:** Every Phase 1 proof log entry must include at least the following fields. This is the interface ops tooling can depend on:
+
+| Field | Type | Present On | Purpose |
+|---|---|---|---|
+| `unit_id` | string | All events | Identifies the KU |
+| `timestamp` | ISO 8601 | All events | When the event occurred |
+| `actor` | string \| null | Commit, disclose | Who triggered the operation (from JWT) |
+| `provider` | string | Commit | Which provider produced the commitment |
+| `overwrite` | bool | Commit (if overwriting) | Distinguishes new vs. replacement commitments |
+| `valid` | bool | Verify | Verification outcome |
+| `error` | string | Failures only | Error detail for WARNING-level events |
+
+> **Minimum operational signal:** Every log entry includes `unit_id` and `timestamp`. `actor` (the authenticated user identity from the JWT, if available) is included for commitment and disclosure events to support after-the-fact attribution. These are the minimum fields that Phase 1 must emit; additional structured audit events are a Phase 3 deliverable.
+
+**Minimum reconciliation capability:** From Phase 1 log signals alone, an operator must be able to answer: *"Which KUs were re-committed this week, by whom, and after how many prior verification failures?"* This requires the overwrite, actor, and verification-result fields defined above. If log aggregation is not available, the same question can be answered by querying the `commitments` table's `created_at` column and correlating with `proof_verification_result` on the KU.
+
+### Phase 1 Trust Model Summary
+
+Phase 1 operates under a **single-trusted-team assumption**. In plain language, this means:
+
+- **Trust boundary:** All authenticated users with Team API access (i.e. holding a valid JWT issued by the CQ auth system) are assumed to be within the same administrative trust domain. There is no distinction between "admin" and "regular" team members for proof operations.
+- Any authenticated team member can commit, re-commit, disclose, or verify any KU. There is no per-user ownership or authorization scoping.
+- Server-side salt storage means the service itself can generate disclosure proofs for any committed KU — there is no holder-only secret.
+- The primary safety mechanism is **auditability, not prevention**: all proof operations are logged, but nothing stops an authenticated user from overwriting a commitment or generating proofs they did not author.
+- Proof state is advisory (see Section 9.1). No workflow gate blocks actions based on proof status.
+
+This model is acceptable for a PoC within a trusted team. It becomes unacceptable the moment CQ introduces multi-tenancy, external auditors, or untrusted actors. The Phase 3 enhancements at the end of this section describe the transition path.
+
+### Phase 1 Accepted Abuse Cases
+
+The following abuse scenarios are **known and accepted** in Phase 1 under the single-trusted-team assumption. They become unacceptable once multi-tenancy or external actors are introduced.
+
+| Abuse Case | Impact | Why Accepted |
+|---|---|---|
+| **Commitment overwrite.** Any authenticated user can call `POST /zkp/commit/{unit_id}` to replace an existing commitment, effectively resetting proof history. | Proof state is lost. A `"failed"` proof can be silently replaced with a fresh `"committed"`. | Phase 1 logs the overwrite event. Phase 3 adds `committed_by` tracking and restricts re-commitment to the original committer or an admin. |
+| **Unattributed disclosure.** Any authenticated user can generate disclosure proofs for any KU, even ones they did not author or commit. | Selective disclosure is not scoped to authorship. | Acceptable in a trusted team where all members have legitimate access. Phase 3 adds per-user disclosure tracking. |
+| **Salt access via DB.** Because salts are stored server-side, anyone with database access can generate arbitrary disclosure proofs. | DB compromise exposes all salt material. | Server-side storage is a PoC simplification (Decision D3). Phase 2 Midnight proofs are generated on-chain without server-held salts. |
+| **Re-commitment after failure.** A user who notices a `"failed"` proof can re-commit the KU with its current (mutated) data, making the new commitment valid — but the original graduation-time commitment is lost. | Audit trail of field changes is obscured. | Phase 1 logs re-commitment. Phase 3 adds a commitment history table rather than a single active row. |
+
+### Re-Commitment and Overwrite Semantics
+
+> **Formal Phase 1 rule:** Re-commitment is **by design, not merely tolerated.** Any authenticated user may call `POST /zkp/commit/{unit_id}` at any time, including after a `"failed"` verification. The overwrite is expected, logged, and safe within the trusted-team model. It is the intended recovery path when KU data has legitimately changed after graduation.
+
+> **Effect on authoritative snapshot:** A re-commitment **creates a new authoritative snapshot**, not a temporary repair. The new commitment becomes the canonical baseline for all future integrity checks. The previous commitment is permanently replaced (Phase 1) or archived (Phase 3 append-only history). Consumers should treat the current commitment as the definitive graduation-time snapshot for this KU.
+
+`POST /zkp/commit/{unit_id}` on a KU that already has a commitment **replaces** the active commitment:
+- The old commitment row is overwritten (not soft-deleted).
+- `commitment_root` on the KU is updated to the new root.
+- `proof_verified_at` and `proof_verification_result` are reset to `NULL` (state returns to `"committed"`).
+- The overwrite is logged at `INFO` level with `unit_id` and `"overwrite": true`.
+
+Phase 3 should change this to append-only (commitment history) rather than overwrite.
 
 ### Phase 3 Enhancements
 
@@ -718,22 +961,28 @@ Phase 1 logs the following at `INFO` level:
 - Restrict re-commitment to the original committer or an admin.
 - Emit structured audit events (not just log lines) for compliance reporting.
 - Record all proof operations in a dedicated `proof_audit_log` table.
+- Commitment history: append new commitments rather than overwriting.
 
 ---
 
 ## 16. Performance and Observability
 
-### Expected Overhead
+### Expected Overhead (Estimates)
 
-| Operation | Time (measured on prototype) | Acceptable Threshold |
+The following are rough estimates from the prototype on a development machine, not production benchmarks. Actual performance may differ under load or on different hardware.
+
+| Operation | Estimated Time | Acceptable Threshold |
 |---|---|---|
 | `create_commitment()` | < 1 ms (7 SHA-256 hashes + 1 root hash) | 5 ms |
 | `create_disclosure_proof()` | < 1 ms (subset of hashes + assembly) | 5 ms |
-| `verify_disclosure_proof()` | < 1 ms (recompute + compare) | 5 ms |
+| `verify_disclosure_proof()` | < 1 ms (recompute + compare) | 5 ms |  
+| `verify_commitment_integrity()` | < 1 ms (recompute root from KU fields, compare) | 5 ms |
 | Retrieval with cached verification | 0 ms (read from DB) | 0 ms |
 | Retrieval with live verification | < 1 ms (1 verify) | 10 ms per KU |
 
-SHA-256 is CPU-bound but extremely fast for 7 small fields. Even at 1000 KUs, a full verification sweep takes < 1 second.
+SHA-256 is CPU-bound but extremely fast for 7 small fields. Even at 1000 KUs, a full verification sweep is estimated to take < 1 second. These estimates should be validated with a proper benchmark (Phase 4, Story 4.1) before relying on them at scale.
+
+**Proof-size growth:** Disclosure proof payload size grows linearly with the number of committed fields: each disclosed field adds a value + salt pair, and each undisclosed field adds a leaf hash. With 7 fields this is negligible (< 2 KB per proof). If the committed field set expands significantly in future versions, payload size should be monitored — this naturally motivates the versioning strategy in [Section 12](#12-field-selection-rationale-and-versioning).
 
 ### Caching Strategy
 
@@ -750,7 +999,7 @@ This is a **write-through cache** — the verification result is always the true
 |---|---|---|
 | `zkp_commitments_created_total` | Counter | Total commitments generated |
 | `zkp_verification_results` | Counter (labels: `result=verified\|failed`) | Verification outcomes |
-| `zkp_verification_duration_seconds` | Histogram | Time spent in `verify_disclosure_proof()` |
+| `zkp_verification_duration_seconds` | Histogram | Time spent in `verify_disclosure_proof()` or `verify_commitment_integrity()` |
 | `zkp_proof_status_distribution` | Gauge (labels: `status=none\|committed\|verified\|failed\|stale`) | Current proof state distribution across all KUs |
 
 **Implementation:** Metrics are emitted via Python `logging` in Phase 1 (structured JSON logs). Phase 2+ can switch to Prometheus client if a metrics endpoint is added.
@@ -836,6 +1085,8 @@ This is a **write-through cache** — the verification result is always the true
 | **Schema migration** | New columns added correctly; existing data backward-compatible |
 | **API proof status** | ReviewItem includes correct proof_status, proof_provider, proof_verified_at in all states |
 | **UI states** | (If UI tests are in scope) Each of the 5 badge variants renders correctly |
+| **Idempotency and overwrite** | Double approval: approving an already-approved KU does not create a duplicate commitment. Repeated commit: `POST /zkp/commit` on an already-committed KU overwrites cleanly and returns a new root. Re-commit after failure: calling `POST /zkp/commit` on a `"failed"` KU resets state to `"committed"` and logs `"overwrite": true`. Stale re-verification: repeated retrieval on a stale KU re-verifies only once per access, not redundantly. Overwrite audit: every overwrite emits an `INFO`-level log entry with the `unit_id`; tests assert this log line is present. |
+| **Concurrent access** | Concurrent query + commit on the same KU does not corrupt state (SQLite WAL serializes writes); concurrent retrieval verification produces consistent results. **Note:** these guarantees are specific to the current SQLite storage backend. If the backend changes (e.g. to PostgreSQL), concurrency tests must be revisited for the new isolation model. |
 
 ### Validation Commands
 
@@ -849,7 +1100,7 @@ make test    # pytest for both team-api and plugin
 
 ## 19. PR Packaging Plan
 
-> **Branch reality:** All the code listed in Appendix A already exists on the working branch with 349 passing tests. The question is not "what to write" but "how to split the existing code into reviewable PRs."
+The PR split below is meant to isolate review concerns, not to imply that code was developed in exactly this order. The working branch already contains all listed code with 349 passing tests; the split gives maintainers focused review scopes.
 
 ### PR 1: Design Doc + Provider Abstraction (Stories 0–2)
 
@@ -861,8 +1112,6 @@ make test    # pytest for both team-api and plugin
 - `server.py` MCP tool additions (`zkp_commit`, `zkp_disclose`, `zkp_verify`)
 - All existing tests (27 team-api + 11 plugin ZKP-specific)
 - Schema additions: `commitments` table, `commitment_root` column
-
-**How to extract:** Cherry-pick or `git diff` the relevant files from the working branch. No code changes needed — these files are already in final form.
 
 **Review focus:** Is the `ZKPProvider` interface the right abstraction? Is hash-commitment acceptable as a Phase 1 PoC?
 
@@ -876,8 +1125,6 @@ make test    # pytest for both team-api and plugin
 - Staleness threshold configuration
 - Integration tests for the full commit → verify → stale cycle
 
-**How to extract:** The graduation hook in `review.py` already exists. The new model fields and retrieval verification are the remaining implementation work in Phase 1. This PR is partly done (graduation hook, basic proof_status) and partly new (rich states, cached verification).
-
 **Review focus:** Is the 5-state model correct? Is 24h staleness the right default? Is lenient failure on approve acceptable?
 
 ### PR 3: API + UI Surface (Stories 7–8)
@@ -888,13 +1135,11 @@ make test    # pytest for both team-api and plugin
 - TypeScript type updates in `types.ts`
 - `make lint` + `make test` green across all packages
 
-**How to extract:** TypeScript changes and UI badge are partially done (2 of 5 states). Extend existing code rather than rewriting.
-
 **Review focus:** Are the UI states and colours right? Does the API response shape make sense for consumers?
 
 ### Commit History
 
-The working branch has a natural commit history from development. If maintainers prefer squashed PRs, each PR can be squash-merged. If they prefer a clean commit-per-story history, I can rebase interactively before opening the PRs.
+The working branch has a natural commit history from development. Each PR can be squash-merged or rebased per maintainer preference.
 
 ---
 
@@ -906,11 +1151,13 @@ The working branch has a natural commit history from development. If maintainers
 |---|---|
 | **Not a true ZKP** | The hash-commitment scheme provides binding + hiding + selective disclosure but is not a zero-knowledge proof in the formal sense. The verifier sees undisclosed leaf hashes, which could theoretically leak information about field distribution. The `ZKPProvider` interface is designed so Midnight's true ZKP backend can replace this without changing call sites. |
 | **Salt storage** | Salts are stored in the `commitments` table alongside the KU. In production (Phase 2+), salts would be managed by the prover and not persisted server-side. |
-| **Commitment immutability** | Commitments are generated at graduation time. If a KU is mutated after commitment (e.g. by confirmation or flagging), the commitment becomes stale. Phase 1 detects this via retrieval verification. Phase 3 adds re-commitment on mutation. |
+| **Commitment immutability** | Commitments are generated at graduation time. If a committed field is mutated after graduation, the commitment becomes invalid. Phase 1 detects this via retrieval verification (`verify_commitment_integrity()`). Phase 3 adds re-commitment on mutation. |
 | **Timing attacks** | `secrets.compare_digest()` is used for root comparison to prevent timing-based side channels. |
-| **No proof of deletion** | Phase 1 does not prove data was deleted. This is a Phase 2 goal—Midnight's on-chain proofs can provide this. |
+| **No proof of deletion** | Phase 1 does not prove data was deleted. This is a Phase 2 goal — Midnight's on-chain proofs may enable this, depending on the final integration model. |
 
 ### OWASP Alignment
+
+> **⚠️ Not for adversarial environments.** Phase 1 assumes a single trusted team domain. The hash-commitment scheme, server-side salt storage, and lack of per-user authorization make this design **unsuitable for multi-tenant, public-facing, or adversarial deployments** without the hardening described in Phase 2–3. If your deployment includes untrusted users, external API consumers, or multi-tenancy, do not ship Phase 1 without tightening the authorization model first.
 
 - **Injection:** All SQL uses parameterised queries. No string interpolation.
 - **Broken auth:** ZKP endpoints inherit existing JWT auth via `get_current_user` dependency.
@@ -960,7 +1207,13 @@ Files created or modified as part of this work:
 
 ## Appendix B: Example API Payloads
 
+> **⚠️ Phase 1 proof format: internal.** All payloads below are CQ-internal implementation examples. Field names, nesting, and serialization may change without notice between phases. Do not treat these shapes as a stable external contract. See [Section 10.2](#102-zkp-specific-endpoints-implemented) for the full format classification.
+>
+> **Stability rule:** Phase 1 disclosure proof payloads are not a long-term compatibility contract and may change before Phase 2 externalization. Any consumer that parses these payloads must be prepared for breaking changes.
+
 ### Commitment Creation
+
+> **⚠️ Privileged response.** This payload includes salts and leaf hashes. It is returned **only** to the caller who creates the commitment (typically the server itself during graduation). It MUST NOT be exposed to consumers or included in query responses. The `/query` and `/review` endpoints never return salt material.
 
 **Request:** `POST /zkp/commit/ku_a1b2c3d4`
 
@@ -995,6 +1248,8 @@ Files created or modified as part of this work:
 ```
 
 ### Selective Disclosure
+
+> **⚠️ Internal format.** This payload structure is a Phase 1 implementation detail and may change without notice. Do not treat it as a stable contract.
 
 **Request:** `POST /zkp/disclose/ku_a1b2c3d4`
 ```json
@@ -1031,6 +1286,8 @@ Files created or modified as part of this work:
 
 ### Verification
 
+> **⚠️ Internal format.** Proof structure and response shape are Phase 1 implementation details and may change without notice.
+
 **Request:** `POST /zkp/verify`
 ```json
 {
@@ -1063,4 +1320,13 @@ Files created or modified as part of this work:
   "proof_verified_at": "2026-03-29T10:05:00Z"
 }
 ```
-2026-03-29-zkp-selective-disclosure-design
+
+---
+
+## Decision Summary: Proposed Defaults
+
+After reading the full document, here is what I am asking maintainers to approve for Phase 1:
+
+> **Approve Phase 1 as:** advisory proof state (no hard gates), trusted-team authorization (single trust domain, no per-user ownership), server-side salt storage (PoC simplification), no automatic backfill of historical KUs, single root-computation algorithm (hash-commitment only), three-PR rollout (design + provider, lifecycle + schema, API + UI). Lenient failure on graduation (approval succeeds even if commitment fails). Cached verification with 24-hour staleness threshold. Current 7-field committed set.
+
+If any of these defaults are unacceptable, see the [Decisions Requested](#decisions-requested-from-maintainers) table for alternatives and trade-offs.
